@@ -114,15 +114,19 @@ int DialogManager::run(BRPC_NAMESPACE::Controller* cntl) {
         if (request_bot_session.empty()
                 || request_bot_session_doc.Parse(request_bot_session.c_str()).HasParseError()
                 || !request_bot_session_doc.IsObject()
+                || !request_bot_session_doc.HasMember("bot_id")
+                || !request_bot_session_doc["bot_id"].IsString()
+                || request_bot_session_doc["bot_id"].GetString() != bot_id
                 || !request_bot_session_doc.HasMember("session_id")
                 || !request_bot_session_doc.HasMember("dialog_state")
                 || !request_bot_session_doc["dialog_state"].HasMember("contexts")
-                || !request_bot_session_doc["dialog_state"]["contexts"].HasMember("dm_session")) {
+                || !request_bot_session_doc["dialog_state"]["contexts"].HasMember("dmkit")
+                || !request_bot_session_doc["dialog_state"]["contexts"]["dmkit"].HasMember("session")) {
             // Not a valid session from DM Kit
             request_doc["bot_session"].SetString("", 0, request_doc.GetAllocator());
         } else {
             dm_session =
-                request_bot_session_doc["dialog_state"]["contexts"]["dm_session"].GetString();
+                request_bot_session_doc["dialog_state"]["contexts"]["dmkit"]["session"].GetString();
         }
     }
     APP_LOG(TRACE) << "dm session: " << dm_session;
@@ -280,7 +284,7 @@ int DialogManager::process_request(const rapidjson::Document& request_doc,
 int DialogManager::call_unit_bot(const std::string& access_token,
                                          const std::string& payload,
                                          std::string& result) {
-    std::string url = "https://aip.baidubce.com/rpc/2.0/unit/bot/chat?access_token=";
+    std::string url = "/rpc/2.0/unit/bot/chat?access_token=";
     url += access_token;
     RemoteServiceParam rsp = {
         url,
@@ -306,14 +310,45 @@ int DialogManager::handle_unsatisfied_intent(rapidjson::Document& unit_response_
                                              rapidjson::Document& bot_session_doc,
                                              const std::string& dm_session,
                                              std::string& response) {
-    std::string action_type = unit_response_doc["result"]["response"]["action_list"][0]["type"].GetString();
-    if (action_type != "satisfy" && action_type != "understood") {
+    std::string action_type;
+    if (unit_response_doc.HasMember("result")
+            && unit_response_doc["result"].HasMember("response")
+            && unit_response_doc["result"]["response"].HasMember("action_list")
+            && unit_response_doc["result"]["response"]["action_list"].Size() > 0
+            && unit_response_doc["result"]["response"]["action_list"][0].HasMember("type")) {
+        action_type = unit_response_doc["result"]["response"]["action_list"][0]["type"].GetString();
+    } else {
+        APP_LOG(WARNING) << "Failed to parse action type from unit bot response: "
+            << utils::json_to_string(unit_response_doc);
+    }
+
+    if (action_type == "satisfy") {
+        response = this->get_error_response(-1, "Unsupported action type satisfy");
+        return 0;
+    }
+    if (action_type != "understood") {
         // DM session should be saved
         rapidjson::Value dm_session_json;
         dm_session_json.SetString(
             dm_session.c_str(), dm_session.length(), bot_session_doc.GetAllocator());
-        bot_session_doc["dialog_state"]["contexts"].AddMember(
-            "dm_session", dm_session_json, bot_session_doc.GetAllocator());
+        if (!bot_session_doc.HasMember("dialog_state")) {
+            rapidjson::Value dialog_state_json(rapidjson::kObjectType);
+            bot_session_doc.AddMember("dialog_state", dialog_state_json, bot_session_doc.GetAllocator());
+        }
+        if (!bot_session_doc["dialog_state"].HasMember("contexts")) {
+            rapidjson::Value contexts_json(rapidjson::kObjectType);
+            bot_session_doc["dialog_state"].AddMember("contexts", contexts_json, bot_session_doc.GetAllocator());
+        }
+        if (!bot_session_doc["dialog_state"]["contexts"].HasMember("dmkit")) {
+            rapidjson::Value contexts_json(rapidjson::kObjectType);
+            bot_session_doc["dialog_state"]["contexts"].AddMember("dmkit", contexts_json, bot_session_doc.GetAllocator());
+        }
+        if (bot_session_doc["dialog_state"]["contexts"]["dmkit"].HasMember("session")) {
+            bot_session_doc["dialog_state"]["contexts"]["dmkit"].RemoveMember("session");
+        }
+
+        bot_session_doc["dialog_state"]["contexts"]["dmkit"].AddMember(
+            "session", dm_session_json, bot_session_doc.GetAllocator());
 
         std::string bot_session = utils::json_to_string(bot_session_doc);
         //unit_response_doc.AddMember("debug", bot_session_doc, unit_response_doc.GetAllocator());
@@ -332,8 +367,26 @@ void DialogManager::set_dm_response(rapidjson::Document& unit_response_doc,
     std::string session_str = PolicyOutputSession::to_json_str(policy_output->session);
     rapidjson::Value dm_session;
     dm_session.SetString(session_str.c_str(), session_str.length(), bot_session_doc.GetAllocator());
-    bot_session_doc["dialog_state"]["contexts"].AddMember(
-        "dm_session", dm_session, bot_session_doc.GetAllocator());
+
+    
+    if (!bot_session_doc.HasMember("dialog_state")) {
+        rapidjson::Value dialog_state_json(rapidjson::kObjectType);
+        bot_session_doc.AddMember("dialog_state", dialog_state_json, bot_session_doc.GetAllocator());
+    }   
+    if (!bot_session_doc["dialog_state"].HasMember("contexts")) {
+        rapidjson::Value contexts_json(rapidjson::kObjectType);
+        bot_session_doc["dialog_state"].AddMember("contexts", contexts_json, bot_session_doc.GetAllocator());    
+    }
+    if (!bot_session_doc["dialog_state"]["contexts"].HasMember("dmkit")) {    
+        rapidjson::Value contexts_json(rapidjson::kObjectType);
+        bot_session_doc["dialog_state"]["contexts"].AddMember("dmkit", contexts_json, bot_session_doc.GetAllocator());
+    }
+    if (bot_session_doc["dialog_state"]["contexts"]["dmkit"].HasMember("session")) {
+        bot_session_doc["dialog_state"]["contexts"]["dmkit"].RemoveMember("session");    
+    }
+    bot_session_doc["dialog_state"]["contexts"]["dmkit"].AddMember(
+        "session", dm_session, bot_session_doc.GetAllocator());
+    
     // DMKit result as a custom reply
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
